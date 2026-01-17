@@ -25,9 +25,15 @@ export default function WhenToMeet() {
   const [timeSlots, setTimeSlots] = useState([]);
   const [responses, setResponses] = useState([]);
   const [participantName, setParticipantName] = useState('');
-  const [selectedSlots, setSelectedSlots] = useState(new Set());
+  const [selectedSlots, setSelectedSlots] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
   const [dragMode, setDragMode] = useState(null); // 'select' or 'deselect'
+  const [anchorRow, setAnchorRow] = useState(0);
+  const [anchorCol, setAnchorCol] = useState(0);
+  const [hoverRow, setHoverRow] = useState(0);
+  const [hoverCol, setHoverCol] = useState(0);
+  const xMouseRef = React.useRef(0);
+  const yMouseRef = React.useRef(0);
   
   // Form states
   const [newMeeting, setNewMeeting] = useState({
@@ -43,7 +49,36 @@ export default function WhenToMeet() {
 
   useEffect(() => {
     loadMeetings();
-  }, []);
+    
+    const handleGlobalMouseMove = (e) => {
+      if (isDragging) {
+        const xMousePos = e.pageX;
+        const yMousePos = e.pageY;
+        
+        // Calculate which cell we're hovering over based on pixel distance
+        // Each cell is approximately 30px tall and 80px wide
+        const newHoverRow = Math.floor((yMousePos - yMouseRef.current) / 30);
+        const newHoverCol = Math.floor((xMousePos - xMouseRef.current) / 80);
+        
+        setHoverRow(anchorRow + newHoverRow);
+        setHoverCol(anchorCol + newHoverCol);
+      }
+    };
+    
+    const handleGlobalMouseUp = () => {
+      if (isDragging) {
+        handleMouseUp();
+      }
+    };
+    
+    document.addEventListener('mousemove', handleGlobalMouseMove);
+    document.addEventListener('mouseup', handleGlobalMouseUp);
+    
+    return () => {
+      document.removeEventListener('mousemove', handleGlobalMouseMove);
+      document.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [isDragging, anchorRow, anchorCol]);
 
   const loadMeetings = async () => {
     if (!supabase) return;
@@ -88,9 +123,9 @@ export default function WhenToMeet() {
     // Pre-select user's previous UNAVAILABLE responses
     if (participantName) {
       const userResponses = resps?.filter(r => 
-        r.participant_name === participantName && !r.is_available // Changed to NOT available
+        r.participant_name === participantName && !r.is_available
       ) || [];
-      setSelectedSlots(new Set(userResponses.map(r => r.time_slot_id)));
+      setSelectedSlots(userResponses.map(r => r.time_slot_id));
     }
     
     setView('meeting');
@@ -180,7 +215,7 @@ export default function WhenToMeet() {
       meeting_id: currentMeeting.id,
       time_slot_id: slot.id,
       participant_name: participantName,
-      is_available: !selectedSlots.has(slot.id) // INVERTED: not selected = available
+      is_available: !selectedSlots.includes(slot.id) // INVERTED: not selected = available
     }));
 
     await supabase.from('responses').insert(userResponses);
@@ -189,34 +224,73 @@ export default function WhenToMeet() {
     loadMeetingDetails(currentMeeting.id);
   };
 
-  const handleSlotMouseDown = (slotId) => {
+  const handleSlotMouseDown = (slotId, row, col, e) => {
     setIsDragging(true);
-    const newSelected = new Set(selectedSlots);
-    if (selectedSlots.has(slotId)) {
-      newSelected.delete(slotId);
+    setAnchorRow(row);
+    setAnchorCol(col);
+    setHoverRow(row);
+    setHoverCol(col);
+    
+    // Store initial mouse position
+    xMouseRef.current = e.pageX;
+    yMouseRef.current = e.pageY;
+    
+    if (selectedSlots.includes(slotId)) {
       setDragMode('deselect');
     } else {
-      newSelected.add(slotId);
       setDragMode('select');
-    }
-    setSelectedSlots(newSelected);
-  };
-
-  const handleSlotMouseEnter = (slotId) => {
-    if (isDragging) {
-      const newSelected = new Set(selectedSlots);
-      if (dragMode === 'select') {
-        newSelected.add(slotId);
-      } else {
-        newSelected.delete(slotId);
-      }
-      setSelectedSlots(newSelected);
     }
   };
 
   const handleMouseUp = () => {
+    if (isDragging && dragMode) {
+      // Get all slots in the selected rectangle
+      const groupedSlots = groupSlotsByDate();
+      const dates = Object.keys(groupedSlots);
+      const hours = getUniqueHours();
+      
+      const minRow = Math.min(anchorRow, hoverRow);
+      const maxRow = Math.max(anchorRow, hoverRow);
+      const minCol = Math.min(anchorCol, hoverCol);
+      const maxCol = Math.max(anchorCol, hoverCol);
+      
+      const slotsToUpdate = [];
+      
+      for (let row = minRow; row <= maxRow; row++) {
+        for (let col = minCol; col <= maxCol; col++) {
+          if (row >= 0 && row < hours.length && col >= 0 && col < dates.length) {
+            const hour = hours[row];
+            const daySlots = Object.values(groupedSlots)[col];
+            const slot = daySlots?.find(s => formatTime(s.slot_time) === hour);
+            if (slot) {
+              slotsToUpdate.push(slot.id);
+            }
+          }
+        }
+      }
+      
+      // Apply the selection/deselection
+      setSelectedSlots(prev => {
+        if (dragMode === 'select') {
+          const newSelected = [...prev];
+          slotsToUpdate.forEach(id => {
+            if (!newSelected.includes(id)) {
+              newSelected.push(id);
+            }
+          });
+          return newSelected;
+        } else {
+          return prev.filter(id => !slotsToUpdate.includes(id));
+        }
+      });
+    }
+    
     setIsDragging(false);
     setDragMode(null);
+    setAnchorRow(0);
+    setAnchorCol(0);
+    setHoverRow(0);
+    setHoverCol(0);
   };
 
   const getAvailabilityCount = (slotId) => {
@@ -287,11 +361,11 @@ export default function WhenToMeet() {
           height: 30px;
           cursor: pointer;
           user-select: none;
-          transition: background-color 0.1s;
-        }
-        
-        .grid-cell:hover {
-          opacity: 0.8;
+          -webkit-user-select: none;
+          -moz-user-select: none;
+          -ms-user-select: none;
+          touch-action: none;
+          transition: none;
         }
         
         input, textarea, select {
@@ -512,7 +586,7 @@ export default function WhenToMeet() {
               onClick={() => {
                 setView('home');
                 setCurrentMeeting(null);
-                setSelectedSlots(new Set());
+                setSelectedSlots([]);
               }}
               style={{ marginBottom: '20px', background: '#666' }}
             >
@@ -594,7 +668,7 @@ export default function WhenToMeet() {
                     </tr>
                   </thead>
                   <tbody>
-                    {getUniqueHours().map(hour => (
+                    {getUniqueHours().map((hour, rowIndex) => (
                       <tr key={hour}>
                         <td style={{ 
                           border: '1px solid #ccc',
@@ -604,17 +678,36 @@ export default function WhenToMeet() {
                         }}>
                           {hour}
                         </td>
-                        {Object.values(groupSlotsByDate()).map((daySlots, dayIndex) => {
+                        {Object.values(groupSlotsByDate()).map((daySlots, colIndex) => {
                           const slot = daySlots.find(s => formatTime(s.slot_time) === hour);
+                          
+                          // Check if this cell is in the drag rectangle
+                          const isInDragRect = isDragging && 
+                            rowIndex >= Math.min(anchorRow, hoverRow) &&
+                            rowIndex <= Math.max(anchorRow, hoverRow) &&
+                            colIndex >= Math.min(anchorCol, hoverCol) &&
+                            colIndex <= Math.max(anchorCol, hoverCol);
+                          
+                          let bgColor = slot && selectedSlots.includes(slot.id) ? '#FFB6C1' : '#7BC18C';
+                          
+                          // Show preview during drag
+                          if (isInDragRect && slot) {
+                            if (dragMode === 'select') {
+                              bgColor = '#FFB6C1';
+                            } else {
+                              bgColor = '#7BC18C';
+                            }
+                          }
+                          
                           return (
                             <td 
-                              key={dayIndex}
+                              key={colIndex}
                               className="grid-cell"
                               style={{ 
-                                background: slot && selectedSlots.has(slot.id) ? '#FFB6C1' : '#7BC18C'
+                                background: bgColor,
+                                border: isInDragRect ? '2px solid #333' : '1px solid #ccc'
                               }}
-                              onMouseDown={() => slot && handleSlotMouseDown(slot.id)}
-                              onMouseEnter={() => slot && handleSlotMouseEnter(slot.id)}
+                              onMouseDown={(e) => slot && handleSlotMouseDown(slot.id, rowIndex, colIndex, e)}
                             />
                           );
                         })}
